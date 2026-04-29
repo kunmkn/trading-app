@@ -1,10 +1,19 @@
 import math
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
+
+
+# -----------------------------
+# Storage config
+# -----------------------------
+
+DATA_DIR = Path("data")
+DATA_FILE = DATA_DIR / "trades.csv"
 
 
 # -----------------------------
@@ -22,6 +31,24 @@ CHECKLIST_FIELDS = [
 MARKETS = ["国内期货", "海外期货", "A股", "美股", "期权"]
 DIRECTIONS = ["多", "空"]
 SETUPS = ["趋势突破", "回调入场", "区间反转", "基本面事件", "价差/套利"]
+
+TRADE_COLUMNS = [
+    "date",
+    "market",
+    "symbol",
+    "direction",
+    "setup",
+    "entry",
+    "stop",
+    "target1",
+    "target2",
+    "exit_price",
+    "quantity",
+    "contract_multiplier",
+    "account_equity",
+    "max_risk_rmb",
+    "thesis",
+] + CHECKLIST_FIELDS
 
 
 def to_number(value: Any) -> float:
@@ -95,27 +122,31 @@ def calc_trade(trade: Dict[str, Any]) -> Metrics:
 
 def calc_portfolio(trades: List[Dict[str, Any]]) -> Dict[str, float]:
     if not trades:
-        return {"total_risk": 0.0, "total_pnl": 0.0, "avg_r": 0.0, "win_rate": 0.0}
+        return {"total_risk": 0.0, "total_pnl": 0.0, "avg_r": 0.0, "win_rate": 0.0, "max_drawdown": 0.0}
 
     metrics = [calc_trade(t) for t in trades]
     total_risk = sum(m.total_risk for m in metrics)
     total_pnl = sum(m.pnl for m in metrics)
     avg_r = sum(m.r_multiple for m in metrics) / len(metrics)
     win_rate = sum(1 for m in metrics if m.pnl > 0) / len(metrics)
+    pnl_curve = build_pnl_curve(trades)
+    max_drawdown = float(pnl_curve["drawdown"].min()) if not pnl_curve.empty else 0.0
     return {
         "total_risk": total_risk,
         "total_pnl": total_pnl,
         "avg_r": avg_r,
         "win_rate": win_rate,
+        "max_drawdown": max_drawdown,
     }
 
 
 def build_rows(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for trade in trades:
+    for idx, trade in enumerate(trades, start=1):
         m = calc_trade(trade)
         rows.append(
             {
+                "序号": idx,
                 "日期": trade.get("date", ""),
                 "市场": trade.get("market", ""),
                 "品种": trade.get("symbol", ""),
@@ -137,6 +168,77 @@ def build_rows(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             }
         )
     return rows
+
+
+def build_pnl_curve(trades: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame(columns=["trade_no", "date", "symbol", "pnl", "cumulative_pnl", "peak", "drawdown"])
+
+    rows: List[Dict[str, Any]] = []
+    chronological = list(reversed(trades))
+    cumulative = 0.0
+    peak = 0.0
+
+    for idx, trade in enumerate(chronological, start=1):
+        m = calc_trade(trade)
+        cumulative += m.pnl
+        peak = max(peak, cumulative)
+        drawdown = cumulative - peak
+        rows.append(
+            {
+                "trade_no": idx,
+                "date": trade.get("date", ""),
+                "symbol": trade.get("symbol", ""),
+                "pnl": m.pnl,
+                "cumulative_pnl": cumulative,
+                "peak": peak,
+                "drawdown": drawdown,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Persistence layer
+# -----------------------------
+
+def normalize_trade_for_storage(trade: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for col in TRADE_COLUMNS:
+        value = trade.get(col, False if col in CHECKLIST_FIELDS else "")
+        if col in CHECKLIST_FIELDS:
+            normalized[col] = bool(value)
+        else:
+            normalized[col] = "" if value is None else str(value)
+    return normalized
+
+
+def load_trades() -> List[Dict[str, Any]]:
+    if not DATA_FILE.exists():
+        return []
+    try:
+        df = pd.read_csv(DATA_FILE, dtype=str, keep_default_na=False)
+    except Exception:
+        return []
+
+    trades: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        trade: Dict[str, Any] = {}
+        for col in TRADE_COLUMNS:
+            if col in CHECKLIST_FIELDS:
+                trade[col] = str(row.get(col, "False")).lower() in {"true", "1", "yes", "y"}
+            else:
+                trade[col] = row.get(col, "")
+        trades.append(trade)
+    return trades
+
+
+def save_trades(trades: List[Dict[str, Any]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    normalized = [normalize_trade_for_storage(t) for t in trades]
+    df = pd.DataFrame(normalized, columns=TRADE_COLUMNS)
+    df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
 
 
 # -----------------------------
@@ -168,6 +270,8 @@ def run_tests() -> None:
         "趋势结构确认": True,
         "量仓配合": True,
         "盈亏比合格": True,
+        "date": "2026-01-01",
+        "symbol": "TEST1",
     }
     m = calc_trade(long_trade)
     assert_almost_equal(m.risk_per_unit, 50, "long risk_per_unit")
@@ -188,6 +292,8 @@ def run_tests() -> None:
         "quantity": "1",
         "contract_multiplier": "10",
         "max_risk_rmb": "5000",
+        "date": "2026-01-02",
+        "symbol": "TEST2",
     }
     m = calc_trade(short_trade)
     assert_almost_equal(m.total_risk, 50, "short total_risk")
@@ -228,6 +334,8 @@ def run_tests() -> None:
         "exit_price": "110",
         "quantity": "-3",
         "contract_multiplier": "10",
+        "date": "2026-01-03",
+        "symbol": "TEST3",
     }
     m = calc_trade(negative_qty_trade)
     assert_almost_equal(m.total_risk, 0, "negative quantity risk clamps to zero")
@@ -238,11 +346,31 @@ def run_tests() -> None:
     assert_almost_equal(portfolio["total_pnl"], 300, "portfolio total_pnl")
     assert_almost_equal(portfolio["avg_r"], (2 + 2 + 0) / 3, "portfolio avg_r")
     assert_almost_equal(portfolio["win_rate"], 2 / 3, "portfolio win_rate")
+    assert_almost_equal(portfolio["max_drawdown"], 0, "portfolio max_drawdown")
 
     rows = build_rows([long_trade])
     assert_equal(rows[0]["总风险"], 100, "export total_risk")
     assert_equal(rows[0]["盈亏"], 200, "export pnl")
     assert_equal(rows[0]["检查得分"], "3/5", "export checklist score")
+
+    loss_trade = {
+        "direction": "多",
+        "entry": "100",
+        "stop": "90",
+        "exit_price": "80",
+        "quantity": "1",
+        "contract_multiplier": "10",
+        "date": "2026-01-04",
+        "symbol": "LOSS",
+    }
+    curve = build_pnl_curve([loss_trade, short_trade, long_trade])
+    assert_equal(len(curve), 3, "pnl curve row count")
+    assert_almost_equal(float(curve.iloc[-1]["cumulative_pnl"]), 100, "pnl curve cumulative")
+    assert_almost_equal(float(curve["drawdown"].min()), -200, "pnl curve max drawdown")
+
+    normalized = normalize_trade_for_storage(long_trade)
+    assert_equal(normalized["趋势结构确认"], True, "storage bool true")
+    assert_equal(normalized["事件风险可控"], False, "storage bool false default")
 
 
 run_tests()
@@ -255,21 +383,19 @@ run_tests()
 st.set_page_config(page_title="交易系统录入台", layout="wide")
 
 st.title("交易系统录入台")
-st.caption("纯记录工具：手动录入交易参数，自动计算风险、R倍数、盈亏和系统执行度。当前版本不接实时行情。")
+st.caption("纯记录工具：手动录入交易参数，自动计算风险、R倍数、盈亏、资金曲线和系统执行度。当前版本不接实时行情。")
 
 if "trades" not in st.session_state:
-    st.session_state.trades = []
-
-if "draft_trade" not in st.session_state:
-    st.session_state.draft_trade = {}
+    st.session_state.trades = load_trades()
 
 portfolio = calc_portfolio(st.session_state.trades)
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 kpi1.metric("组合风险占用", f"¥{portfolio['total_risk']:,.0f}")
 kpi2.metric("已记录盈亏", f"¥{portfolio['total_pnl']:,.0f}")
 kpi3.metric("平均R", f"{portfolio['avg_r']:.2f}R")
 kpi4.metric("胜率", f"{portfolio['win_rate'] * 100:.1f}%")
+kpi5.metric("最大回撤", f"¥{portfolio['max_drawdown']:,.0f}")
 
 st.divider()
 
@@ -338,6 +464,7 @@ with left:
                 st.error("请先填写品种/代码。")
             else:
                 st.session_state.trades.insert(0, trade)
+                save_trades(st.session_state.trades)
                 st.success("已保存交易。")
                 st.rerun()
 
@@ -353,6 +480,22 @@ with right:
     st.metric("已实现/浮动盈亏", f"¥{preview_metrics.pnl:,.0f}")
     st.metric("本笔R倍数", f"{preview_metrics.r_multiple:.2f}R")
     st.info(f"系统检查得分：{preview_metrics.checklist_score}/5")
+
+st.divider()
+
+st.subheader("PnL 曲线与回撤")
+
+pnl_curve = build_pnl_curve(st.session_state.trades)
+if not pnl_curve.empty:
+    chart_df = pnl_curve.set_index("trade_no")[["cumulative_pnl", "drawdown"]]
+    st.line_chart(chart_df, use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("当前累计PnL", f"¥{pnl_curve.iloc[-1]['cumulative_pnl']:,.0f}")
+    c2.metric("最高累计PnL", f"¥{pnl_curve['peak'].max():,.0f}")
+    c3.metric("最大回撤", f"¥{pnl_curve['drawdown'].min():,.0f}")
+else:
+    st.info("暂无交易记录，保存交易后会自动生成 PnL 曲线。")
 
 st.divider()
 
@@ -386,11 +529,19 @@ if st.session_state.trades:
         use_container_width=True,
     )
 
-    if st.button("清空全部交易", type="secondary"):
+    col1, col2 = st.columns(2)
+    if col1.button("保存当前全部交易到 data/trades.csv", type="secondary", use_container_width=True):
+        save_trades(st.session_state.trades)
+        st.success("已保存。")
+
+    if col2.button("清空全部交易", type="secondary", use_container_width=True):
         st.session_state.trades = []
+        save_trades(st.session_state.trades)
         st.rerun()
 else:
     st.info("暂无交易记录。先录入一笔交易。")
+
+st.caption(f"数据文件：{DATA_FILE.as_posix()}。部署到 Streamlit Cloud 时，本地文件存储适合轻量使用；长期稳定存储建议后续接 Supabase、Google Sheets 或数据库。")
 
 
 # -----------------------------
