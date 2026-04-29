@@ -8,6 +8,13 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
+    Credentials = None
+
 
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "trades.csv"
@@ -431,6 +438,111 @@ def save_trades(trades: List[Dict[str, Any]]) -> None:
     pd.DataFrame([normalize_trade_for_storage(t) for t in trades], columns=TRADE_COLUMNS).to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
 
 
+def google_sheets_enabled() -> bool:
+    return (
+        gspread is not None
+        and Credentials is not None
+        and "gcp" in st.secrets
+        and "service_account_json" in st.secrets["gcp"]
+        and "google_sheets" in st.secrets
+    )
+
+
+def get_gspread_client():
+    if not google_sheets_enabled():
+        return None
+    service_account_info = json.loads(st.secrets["gcp"]["service_account_json"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def get_google_sheet():
+    client = get_gspread_client()
+    if client is None:
+        return None
+    spreadsheet_name = st.secrets["google_sheets"].get("spreadsheet_name", "trading_log")
+    return client.open(spreadsheet_name)
+
+
+def get_or_create_worksheet(spreadsheet, title: str, rows: int = 1000, cols: int = 30):
+    try:
+        return spreadsheet.worksheet(title)
+    except Exception:
+        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def sync_to_google_sheets(trades: List[Dict[str, Any]], settings: Dict[str, Any]) -> bool:
+    spreadsheet = get_google_sheet()
+    if spreadsheet is None:
+        return False
+
+    trades_sheet_name = st.secrets["google_sheets"].get("trades_sheet", "trades")
+    settings_sheet_name = st.secrets["google_sheets"].get("settings_sheet", "settings")
+
+    trades_ws = get_or_create_worksheet(spreadsheet, trades_sheet_name)
+    settings_ws = get_or_create_worksheet(spreadsheet, settings_sheet_name, rows=20, cols=5)
+
+    normalized_trades = [normalize_trade_for_storage(t) for t in trades]
+    trades_values = [TRADE_COLUMNS] + [[row.get(col, "") for col in TRADE_COLUMNS] for row in normalized_trades]
+    trades_ws.clear()
+    if trades_values:
+        trades_ws.update(trades_values)
+
+    settings_values = [
+        ["key", "value"],
+        ["initial_equity", str(max(0.0, to_number(settings.get("initial_equity", 1000000.0))))],
+    ]
+    settings_ws.clear()
+    settings_ws.update(settings_values)
+    return True
+
+
+def load_from_google_sheets() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    spreadsheet = get_google_sheet()
+    if spreadsheet is None:
+        return [], {"initial_equity": 1000000.0}
+
+    trades_sheet_name = st.secrets["google_sheets"].get("trades_sheet", "trades")
+    settings_sheet_name = st.secrets["google_sheets"].get("settings_sheet", "settings")
+
+    trades: List[Dict[str, Any]] = []
+    try:
+        trades_ws = spreadsheet.worksheet(trades_sheet_name)
+        records = trades_ws.get_all_records()
+        trades = [normalize_trade_for_storage(normalize_loaded_row(record)) for record in records]
+    except Exception:
+        trades = []
+
+    settings = {"initial_equity": 1000000.0}
+    try:
+        settings_ws = spreadsheet.worksheet(settings_sheet_name)
+        rows = settings_ws.get_all_values()
+        for row in rows[1:]:
+            if len(row) >= 2 and row[0] == "initial_equity":
+                settings["initial_equity"] = max(0.0, to_number(row[1]))
+    except Exception:
+        pass
+
+    return trades, settings
+
+
+def normalize_loaded_row(raw_trade: Dict[str, Any]) -> Dict[str, Any]:
+    trade: Dict[str, Any] = {}
+    for col in TRADE_COLUMNS:
+        if col in CHECKLIST_FIELDS:
+            value = raw_trade.get(col, False)
+            trade[col] = value if isinstance(value, bool) else str(value).lower() in {"true", "1", "yes", "y"}
+        elif col == "action":
+            trade[col] = raw_trade.get(col, "开仓") or "开仓"
+        else:
+            trade[col] = "" if raw_trade.get(col) is None else str(raw_trade.get(col, ""))
+    return trade
+
+
 def assert_almost_equal(actual: float, expected: float, label: str, tolerance: float = 1e-9) -> None:
     if abs(actual - expected) > tolerance:
         raise AssertionError(f"{label}: expected {expected}, got {actual}")
@@ -502,6 +614,25 @@ with st.sidebar:
         st.success("账户设置已保存。")
         st.rerun()
     st.caption("Equity = 初始权益 + 已实现PnL + 未实现PnL。")
+    st.caption(f"Google Sheets secrets: {'已读取' if google_sheets_enabled() else '未启用'}")
+
+    if st.button("一键同步到 Google Sheets", use_container_width=True):
+        if sync_to_google_sheets(st.session_state.trades, st.session_state.settings):
+            st.success("已同步到 Google Sheets。")
+        else:
+            st.error("Google Sheets 未启用。请检查 secrets、requirements.txt 和表格分享权限。")
+
+    if st.button("从 Google Sheets 读取", use_container_width=True):
+        if google_sheets_enabled():
+            cloud_trades, cloud_settings = load_from_google_sheets()
+            st.session_state.trades = cloud_trades
+            st.session_state.settings = cloud_settings
+            save_trades(st.session_state.trades)
+            save_settings(st.session_state.settings)
+            st.success("已从 Google Sheets 读取。")
+            st.rerun()
+        else:
+            st.error("Google Sheets 未启用。请检查 secrets、requirements.txt 和表格分享权限。")
 
 initial_equity = float(st.session_state.settings.get("initial_equity", 1000000.0))
 portfolio = calc_portfolio(st.session_state.trades, initial_equity)
@@ -667,5 +798,3 @@ else:
     st.info("暂无交易记录。先录入一笔交易。")
 
 st.caption(f"数据文件：{DATA_FILE.as_posix()}；账户设置文件：{SETTINGS_FILE.as_posix()}。Streamlit Cloud 本地文件存储适合轻量使用；长期稳定存储建议接 Supabase、Google Sheets 或数据库。")
-st.write("是否读取到 gcp secrets：", "gcp" in st.secrets)
-st.write("是否读取到 google_sheets secrets：", "google_sheets" in st.secrets)
