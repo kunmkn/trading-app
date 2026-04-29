@@ -667,3 +667,4 @@ else:
     st.info("暂无交易记录。先录入一笔交易。")
 
 st.caption(f"数据文件：{DATA_FILE.as_posix()}；账户设置文件：{SETTINGS_FILE.as_posix()}。Streamlit Cloud 本地文件存储适合轻量使用；长期稳定存储建议接 Supabase、Google Sheets 或数据库。")
+st.write("是否启用云端：", cloud_storage_enabled())
