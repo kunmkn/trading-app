@@ -466,7 +466,7 @@ def get_google_sheet():
         return None
 
     sheet_url = st.secrets["google_sheets"].get("spreadsheet_url")
-    return client.open_by_url("https://docs.google.com/spreadsheets/d/1X2nHTspWfBtGLl1SZ8OCwfj7lqCVqlVNR6_MAs5pv_o/edit?gid=0#gid=0)
+    return client.open_by_url("https://docs.google.com/spreadsheets/d/1X2nHTspWfBtGLl1SZ8OCwfj7lqCVqlVNR6_MAs5pv_o/edit?gid=0#gid=0")
 
 
 def get_or_create_worksheet(spreadsheet, title: str, rows: int = 1000, cols: int = 30):
